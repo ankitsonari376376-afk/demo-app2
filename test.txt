@@ -1,0 +1,2881 @@
+Platform/.gitlab/build.yaml
+# All jobs here ONLY run manually
+.manual-rules: &manual-rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never     # never run on schedule
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+    - when: never
+
+
+ 
+# ── Default ──────────────────────────────────────────────────
+default:
+  image: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+  services:
+    - name: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+      command: ["--tls=false"]
+      alias: docker
+
+
+  before_script:
+    - apk add --no-cache git
+    - docker info
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY"
+        -u "$CI_REGISTRY_USER" --password-stdin
+
+  tags:
+    - docker
+    - $RUNNER_TAG
+
+prepare:tag1:
+  stage: prepare1
+  <<: *manual-rules
+  tags:
+    - docker
+    - $RUNNER_TAG
+  before_script: []   # skip docker login
+  script:
+  - |
+    TIMESTAMP=$(date +%Y%m%d%H%M%S)   
+    echo "TIMESTAMP   : ${TIMESTAMP}"
+     #echo "RELEASE_TAG=${RELEASE_TAG}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "TIMESTAMP=${TIMESTAMP}"   >> "${CI_PROJECT_DIR}/build.env"
+     
+  artifacts:
+    reports:
+      dotenv: "${CI_PROJECT_DIR}/build.env"    # exports RELEASE_TAG into all downstream jobs
+    expire_in: 1 day
+  
+
+  
+
+# ── Reusable build template ───────────────────────────────────
+.build1:
+  stage: build1
+  <<: *manual-rules
+  needs:
+    - job: prepare:tag1
+      artifacts: true
+  tags:
+    - docker
+    - $RUNNER_TAG 
+  script:
+  - |
+    echo "Starting build script..."
+    PHASE="${PHASE_NAME:-testphase1}"               
+    USER_TAG="${IMAGE_TAG:-ltst}"   
+    REPO_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_NAMESPACE}/${REPO_SLUG}.git"
+    SERVICE_BRANCH="${SERVICE_BRANCH:-main}"
+    echo "Cloning ${CI_PROJECT_NAMESPACE}/${REPO_SLUG} @ ${SERVICE_BRANCH} ..."
+    git clone \
+      --depth 1 \
+      --branch "${SERVICE_BRANCH}" \
+      "$REPO_URL" \
+      repo
+    echo "HEAD: $(git -C repo rev-parse --short HEAD)"
+
+    
+
+    # ---------------------------
+    # Build coordinates
+    # --------------------------
+    IMAGE_BASE="${CI_REGISTRY}/${CI_PROJECT_PATH}/${PHASE}/${IMAGE_NAME}"
+    IMAGE_TAG=$IMAGE_BASE
+    SERVICE_SHA=$(git -C repo rev-parse HEAD)
+    SERVICE_URL="https://${CI_SERVER_HOST}/${CI_PROJECT_NAMESPACE}/${REPO_SLUG}"
+
+    # 3. Pull cache image — :latest on main, nothing on other branches
+    #    (other branches only push :<branch>-<sha>, no floating tag to pull)
+    
+    #if [ "$CI_COMMIT_REF_NAME" = "main" ]; then
+     # docker pull "${IMAGE_BASE}:latest" 2>/dev/null || true
+    #fi
+
+    # 4. Build with BuildKit
+    #    Every service repo has a Dockerfile at its root.
+    #    Build context = repo/  ->  Docker finds repo/Dockerfile automatically.
+    echo "Starting Docker Build..."
+    #CACHE_FROM="${IMAGE_BASE}:latest"
+
+    export DOCKER_BUILDKIT=1
+    BUILD_SECRET_ARG=""
+
+    if [ "$USE_BUILD_SECRET" = "true" ]; then
+      BUILD_SECRET_ARG="--secret id=ci_job_token,env=CI_JOB_TOKEN"
+    fi
+
+    docker build \
+      $BUILD_SECRET_ARG \
+      --platform "${BUILD_PLATFORM}" \
+      --build-arg BUILDKIT_INLINE_CACHE=1 \
+      --build-arg GIT_COMMIT="${CI_COMMIT_SHORT_SHA}" \
+      --build-arg GIT_BRANCH="${CI_COMMIT_REF_NAME}" \
+      --build-arg BUILD_DATE="${TIMESTAMP}" \
+      -t "${IMAGE_BASE}:${USER_TAG}-${TIMESTAMP}" \
+      repo
+
+    
+
+      #--cache-from "${IMAGE_BASE}:latest" \
+      #--build-arg  BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        
+    # ------------------------------------------------------
+    # Tag timestamp version for non-main branch
+    # ------------------------------------------------------
+    #docker tag "${IMAGE_BASE}:${USER_TAG}" "${IMAGE_BASE}:${USER_TAG}-${TIMESTAMP}"
+    
+    echo "Image ready to push : ${IMAGE_BASE}:${USER_TAG}-${TIMESTAMP}"
+
+    docker push "${IMAGE_BASE}:${USER_TAG}-${TIMESTAMP}"
+    echo "Build Completed: ${IMAGE_BASE}:${USER_TAG}-${TIMESTAMP}"
+
+
+    # 5. Tag :latest on main only
+   # if [ "$CI_COMMIT_REF_NAME" = "main" ]; then
+    #  docker tag "${IMAGE_BASE}:${USER_TAG}" "${IMAGE_BASE}:latest"
+    #fi
+
+    # 6. Push
+    #    main branch  ->  :main-<sha>  :latest
+    #    other branch ->  :branchname-<sha>
+    #docker push "${IMAGE_BASE}:${USER_TAG}"
+    
+    
+    #if [ "$CI_COMMIT_REF_NAME" = "main" ]; then
+     # docker push "${IMAGE_BASE}:latest"
+    #fi
+
+    #echo "Build Completed: ${IMAGE_BASE}:${USER_TAG}"
+    
+
+  after_script:
+    - rm -rf repo   # free runner disk space
+
+  
+
+
+# ══════════════════════════════════════════════════════════════
+# One job per service — all run in parallel
+# Each repo root contains a Dockerfile; no path config needed.
+# Override CLONE_BRANCH per job if a service uses a different default branch.
+# ══════════════════════════════════════════════════════════════
+
+build1:service-aus:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-aus
+    IMAGE_NAME: opnms3ps-aus
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build1:service-wui:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-wui
+    IMAGE_NAME: opnms3ps-wui
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build1:service-agw:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-agw
+    IMAGE_NAME: opnms3ps-agw
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build1:service-cfm:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-cfm
+    IMAGE_NAME: opnms3ps-cfm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build1:service-ewi:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-ewi
+    IMAGE_NAME: opnms3ps-ewi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build1:service-nbi:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-nbi
+    IMAGE_NAME: opnms3ps-nbi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+    USE_BUILD_SECRET: "true"
+
+build1:service-nem:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-nem
+    IMAGE_NAME: opnms3ps-nem
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+# build1:service-swm:
+#   extends: .build1
+#   variables:
+#     REPO_SLUG:  opnms3ps-swm
+#     IMAGE_NAME: opnms3ps-swm
+#     BUILD_PLATFORM: "linux/amd64"
+#     GIT_STRATEGY: clone
+
+# build1:service-wfe:
+#   extends: .build1
+#   variables:
+#     REPO_SLUG:  opnms3ps-wfe
+#     IMAGE_NAME: opnms3ps-wfe
+#     BUILD_PLATFORM: "linux/amd64"
+#     GIT_STRATEGY: clone
+
+build1:service-rpm:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-rpm
+    IMAGE_NAME: opnms3ps-rpm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build1:service-wbs:
+  extends: .build1
+  variables:
+    REPO_SLUG:  opnms3ps-wbs
+    IMAGE_NAME: opnms3ps-wbs
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+  
+# build1:service-tlc:
+#   extends: .build1
+#   variables:
+#     REPO_SLUG:  opnms3ps-tlc
+#     IMAGE_NAME: opnms3ps-tlc
+#     BUILD_PLATFORM: "linux/amd64"
+#     GIT_STRATEGY: clone
+
+
+
+zip:helm:
+  stage: zip-helm
+  <<: *manual-rules
+  services: []   # disables dind for this job 
+  variables:
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+       
+
+  before_script:
+    - apk add --no-cache git curl gzip tar bash zip
+    - rm -f helm.tar.gz
+    - wget -O helm.tar.gz https://get.helm.sh/helm-v3.14.0-linux-amd64.tar.gz
+    - tar -xzf helm.tar.gz
+    - mv linux-amd64/helm /usr/local/bin/helm
+    - helm version
+
+  needs:
+    - job: prepare:tag1
+      artifacts: true
+    - job: build1:service-aus
+      optional: true
+    - job: build1:service-wui
+      optional: true
+    - job: build1:service-agw
+      optional: true
+    - job: build1:service-cfm
+      optional: true
+    - job: build1:service-ewi
+      optional: true
+    - job: build1:service-nbi
+      optional: true
+    - job: build1:service-nem
+      optional: true
+    - job: build1:service-wbs
+      optional: true
+    - job: build1:service-rpm
+      optional: true
+    # - job: build1:service-tlc
+    #   optional: true
+    # - job: build1:service-swm
+    #   optional: true
+    # - job: build1:service-wfe
+    #   optional: true
+    
+  script:
+    - |
+      rm -rf src
+           
+      PHASE_NAME="${PHASE_NAME:-testphase1}"          
+      IMAGE_TAG="${IMAGE_TAG:-ltst}"
+
+
+      # Clone repo
+      git clone --branch "$CI_COMMIT_REF_NAME" \
+        "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" src
+
+      rm -rf src/.git
+
+      cd src/helm/opnms3ps-stack
+
+      BASE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}"
+      FINAL_TAG="${IMAGE_TAG}-${TIMESTAMP}"
+      
+
+      echo "Updating imageTag.yaml..."
+    
+
+      sed -i "s|imageBase: \".*\"|imageBase: \"${BASE_PATH}/${PHASE_NAME}\"|g" imageTag.yaml
+      sed -i "s|tag: \".*\"|tag: \"${FINAL_TAG}\"|g" imageTag.yaml
+
+    
+      set -e
+
+      echo "Building Helm dependencies..."
+      helm dependency build
+
+      echo "Packaging Helm chart..."
+      helm package .
+
+      # Capture tgz
+      TGZ_FILE=$(ls *.tgz)
+
+      # Naming  
+      PACKAGE_NAME="${PHASE_NAME}-${IMAGE_TAG}"
+      VERSION="latest"
+
+      # Create index.yaml
+      helm repo index .
+
+      # Create manifest.zip
+      echo "Creating manifest.zip..."
+      cd ../../manual-deployment
+      zip -r opnms3ps_manifest_templates.zip opnms3ps_manifest_templates
+
+      # Move files to root
+      mv opnms3ps_manifest_templates.zip "$CI_PROJECT_DIR/"
+      cd "$CI_PROJECT_DIR"
+
+      mv src/helm/opnms3ps-stack/${TGZ_FILE} .
+      mv src/helm/opnms3ps-stack/index.yaml .
+
+      echo "Uploading files..."
+  
+
+      # curl --fail --show-error --silent \
+      #    --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+      #    --upload-file index.yaml \
+      #    "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/index.yaml"
+
+      curl --fail --show-error --silent \
+         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+         --upload-file ${TGZ_FILE} \
+         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/${TGZ_FILE}"
+
+      curl --fail --show-error --silent \
+         --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+         --upload-file opnms3ps_manifest_templates.zip \
+         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/opnms3ps_manifest_templates.zip"
+
+      echo ""
+      echo " Packaging completed successfully"
+      echo ""
+
+      echo "========= DOWNLOAD COMMANDS ========="
+      echo ""
+
+      #echo "Download index.yaml*****************************"
+      # echo "curl -L \\"
+      # echo "  --header \"PRIVATE-TOKEN: <PAT-token>\" \\"
+      # echo "  -o index.yaml \\"
+      # echo "  \"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/index.yaml\""
+      # echo ""
+
+      echo "Download Helm chart****************************"
+      echo "curl -L \\"
+      echo "  --header \"PRIVATE-TOKEN: <your-token>\" \\"
+      echo "  -o ${TGZ_FILE} \\"
+      echo "  \"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/${TGZ_FILE}\""
+      echo ""
+
+      echo "Download opnms3ps_manifest_templates.zip*********"
+      echo "curl -L \\"
+      echo "  --header \"PRIVATE-TOKEN: <your-token>\" \\"
+      echo "  -o opnms3ps_manifest_templates.zip \\"
+      echo "  \"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${VERSION}/opnms3ps_manifest_templates.zip\""
+
+
+
+
+
+
+
+
+
+Platform/.gitlab/schedule-build-deploy-sanity.yaml
+schedule-build-deploy-sanity.yaml
+# All jobs here ONLY run on schedule
+.schedule-rules: &schedule-rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: never
+    - when: never  # skip entirely for manual/push pipelines
+
+# ── Default ──────────────────────────────────────────────────
+default:
+  image: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+  services:
+    - name: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+      command: ["--tls=false"]
+      alias: docker
+
+
+  before_script:
+    - apk add --no-cache git
+    - docker info
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY"
+        -u "$CI_REGISTRY_USER" --password-stdin
+
+  tags:
+    - docker
+    - $RUNNER_TAG
+   
+  
+
+prepare:tag:
+  stage: prepare
+  <<: *schedule-rules
+  tags:
+    - docker
+    - $RUNNER_TAG
+  before_script: []   # skip docker login
+  variables:
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone        # MUST be clone for helm folder acces
+    
+  script:
+  - |
+    
+   
+    TIMESTAMP=$(date +%Y%m%d%H%M%S)   
+    echo "TIMESTAMP   : ${TIMESTAMP}"
+
+    
+    SANITY_PHASE_NAME=dev-ns
+    NAMESPACE_NAME=dev-ns
+    SANITY_IMAGE_TAG=cdtest
+    FINAL_TAG=${SANITY_IMAGE_TAG}-${TIMESTAMP}
+    SANITY_SERVICE_BRANCH=main
+    DATABASE_NAME=db-dev-ns
+    PACKAGE_NAME="dev-ns"
+    PACKAGE_VERSION="cdtest"
+
+    echo "SANITY_PHASE_NAME=${SANITY_PHASE_NAME}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "NAMESPACE_NAME=${NAMESPACE_NAME}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "SANITY_IMAGE_TAG=${SANITY_IMAGE_TAG}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "TIMESTAMP=${TIMESTAMP}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "FINAL_TAG=${FINAL_TAG}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "SANITY_SERVICE_BRANCH=${SANITY_SERVICE_BRANCH}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "DATABASE_NAME=${DATABASE_NAME}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "PACKAGE_NAME=${PACKAGE_NAME}" >> "${CI_PROJECT_DIR}/build.env"
+    echo "PACKAGE_VERSION=${PACKAGE_VERSION}" >> "${CI_PROJECT_DIR}/build.env"
+
+    echo "===== build.env contents ====="
+    cat "${CI_PROJECT_DIR}/build.env"
+    echo "============================="
+
+  artifacts:
+    reports:
+      dotenv: "${CI_PROJECT_DIR}/build.env"    # exports RELEASE_TAG into all downstream jobs
+    expire_in: 1 day
+
+
+      
+
+
+# ── Reusable build template ───────────────────────────────────
+.build:
+  stage: build
+  <<: *schedule-rules
+  needs:
+    - job: prepare:tag
+      artifacts: true   
+
+  script:
+  - |
+
+
+    echo "Starting build script..."
+                  
+    REPO_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_NAMESPACE}/${REPO_SLUG}.git"
+  
+    echo "Cloning ${CI_PROJECT_NAMESPACE}/${REPO_SLUG} @ ${SANITY_SERVICE_BRANCH} ..."
+    git clone \
+      --depth 1 \
+      --branch "${SANITY_SERVICE_BRANCH}" \
+      "$REPO_URL" \
+      repo
+    echo "HEAD: $(git -C repo rev-parse --short HEAD)"
+
+    
+
+    # ---------------------------
+    # Build coordinates
+    # --------------------------
+    IMAGE_BASE="${CI_REGISTRY}/${CI_PROJECT_PATH}/${SANITY_PHASE_NAME}/${REPO_SLUG}"
+   
+    SERVICE_SHA=$(git -C repo rev-parse HEAD)
+    SERVICE_URL="https://${CI_SERVER_HOST}/${CI_PROJECT_NAMESPACE}/${REPO_SLUG}"
+
+    # 3. Pull cache image — :latest on main, nothing on other branches
+    #    (other branches only push :<branch>-<sha>, no floating tag to pull)
+    
+    #if [ "$CI_COMMIT_REF_NAME" = "main" ]; then
+     # docker pull "${IMAGE_BASE}:latest" 2>/dev/null || true
+    #fi
+
+    # 4. Build with BuildKit
+    #    Every service repo has a Dockerfile at its root.
+    #    Build context = repo/  ->  Docker finds repo/Dockerfile automatically.
+    
+    #CACHE_FROM="${IMAGE_BASE}:latest"
+    
+    echo "Starting Docker Build..."
+    export DOCKER_BUILDKIT=1
+    BUILD_SECRET_ARG=""
+
+    if [ "$USE_BUILD_SECRET" = "true" ]; then
+      BUILD_SECRET_ARG="--secret id=ci_job_token,env=CI_JOB_TOKEN"
+    fi
+
+    docker build \
+      ${BUILD_SECRET_ARG} \
+      --platform "${BUILD_PLATFORM}" \
+      --build-arg BUILDKIT_INLINE_CACHE=1 \
+      --build-arg GIT_COMMIT="${CI_COMMIT_SHORT_SHA}" \
+      --build-arg GIT_BRANCH="${CI_COMMIT_REF_NAME}" \
+      --build-arg BUILD_DATE="${TIMESTAMP}" \
+      -t "${IMAGE_BASE}:${SANITY_IMAGE_TAG}-${TIMESTAMP}" \
+      repo
+
+      #--cache-from "${IMAGE_BASE}:latest" \
+      #--build-arg  BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        
+    # ------------------------------------------------------
+    # Tag timestamp version for non-main branch
+    # ------------------------------------------------------
+    #docker tag "${IMAGE_BASE}:${SANITY_IMAGE_TAG}" "${IMAGE_BASE}:${SANITY_IMAGE_TAG}-${TIMESTAMP}"
+    
+    echo "Image ready to push : ${IMAGE_BASE}:${SANITY_IMAGE_TAG}-${TIMESTAMP}"
+
+    docker push "${IMAGE_BASE}:${SANITY_IMAGE_TAG}-${TIMESTAMP}"
+    echo "Build Completed: ${IMAGE_BASE}:${SANITY_IMAGE_TAG}-${TIMESTAMP}"
+
+
+
+
+  after_script:
+    - rm -rf repo   # free runner disk space
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════
+# One job per service — all run in parallel
+# Each repo root contains a Dockerfile; no path config needed.
+# Override CLONE_BRANCH per job if a service uses a different default branch.
+# ══════════════════════════════════════════════════════════════
+
+build:service-aus:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-aus
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+    
+
+build:service-wui:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-wui
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build:service-agw:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-agw
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build:service-cfm:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-cfm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build:service-ewi:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-ewi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build:service-nbi:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-nbi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+    USE_BUILD_SECRET: "true"
+
+build:service-nem:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-nem
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build:service-rpm:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-rpm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+build:service-wbs:
+  extends: .build
+  variables:
+    REPO_SLUG:  opnms3ps-wbs
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+# build:service-swm:
+#   extends: .build
+#   variables:
+#     REPO_SLUG:  opnms3ps-swm
+#     BUILD_PLATFORM: "linux/amd64"
+#     GIT_STRATEGY: clone 
+
+# build:service-tlc:
+#   extends: .build
+#   variables:
+#     REPO_SLUG:  opnms3ps-tlc
+#     BUILD_PLATFORM: "linux/amd64"
+#     GIT_STRATEGY: clone 
+
+# build:service-wfe:
+#   extends: .build
+#   variables:
+#     REPO_SLUG:  opnms3ps-wfe
+#     BUILD_PLATFORM: "linux/amd64"
+#     GIT_STRATEGY: clone
+
+deploy:helm:
+  stage: deploy
+  <<: *schedule-rules
+  tags:
+    - shell-runner
+  variables:
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+ 
+  needs:
+    - job: prepare:tag
+      artifacts: true
+    - build:service-aus
+    - build:service-wui
+    - build:service-agw
+    - build:service-cfm
+    - build:service-ewi
+    - build:service-nem
+    - build:service-wbs
+    - build:service-nbi
+    - build:service-rpm  
+    #- build:service-swm
+    #- build:service-tlc
+    #- build:service-wfe
+    
+
+
+  before_script:
+    - export KUBECONFIG=/home/gitlab-runner/.kube/config
+
+  script:
+    - |  
+       
+      
+        echo "Deploying with tag: $FINAL_TAG"
+
+        pwd
+
+        # Navigate to helm chart
+        cd helm/opnms3ps-stack
+        echo "Current directory: $(pwd)"
+        ls -l      
+    
+
+        if helm list -n ${NAMESPACE_NAME} | grep -q opnms3ps-stack; then
+          echo "Uninstalling opnms3ps-stack "
+          helm uninstall opnms3ps-stack -n ${NAMESPACE_NAME}
+          sleep 30
+        fi
+
+      
+
+        BASE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}"
+
+         # update all imageBase
+        sed -i "s|imageBase: \".*\"|imageBase: \"${BASE_PATH}/${SANITY_PHASE_NAME}\"|g" imageTag.yaml
+
+        # update all tags
+        sed -i "s|tag: \".*\"|tag: \"${FINAL_TAG}\"|g" imageTag.yaml
+
+        PRIMARY_POD=$(kubectl get cluster opnms3ps-postgres -n opnms3ps-postgres-ns -o jsonpath='{.status.currentPrimary}')
+  
+        if [ -z "$PRIMARY_POD" ]; then
+          echo "Failed to fetch primary pod from cluster status"; exit 1
+        fi
+    
+        PRIMARY_POD=$(kubectl get cluster opnms3ps-postgres -n opnms3ps-postgres-ns -o jsonpath='{.status.currentPrimary}')
+  
+        if [ -z "$PRIMARY_POD" ]; then
+          echo "Failed to fetch primary pod from cluster status"; exit 1
+        fi
+    
+        # DROP DATABASE - ${DATABASE_NAME}
+        echo "DROPPING DATABASE ${DATABASE_NAME}"
+        kubectl exec -n opnms3ps-postgres-ns ${PRIMARY_POD} -c postgres -- psql -U postgres -c "DROP DATABASE IF EXISTS \"$DATABASE_NAME\"  WITH (FORCE);"
+        sleep 30s
+
+        echo "CREATING DATABASE ${DATABASE_NAME}"
+        kubectl exec -n opnms3ps-postgres-ns ${PRIMARY_POD} -c postgres -- psql -U postgres -c "CREATE DATABASE \"$DATABASE_NAME\" OWNER nmsuser;"
+        sleep 30s
+
+
+
+        # Deploy
+        helm dependency update
+        sleep 10
+
+        helm upgrade --install opnms3ps-stack . -f values.yaml -f imageTag.yaml \
+          --namespace ${NAMESPACE_NAME} \
+          --create-namespace \
+          --set global.namespace="${NAMESPACE_NAME}"
+
+        echo "Waiting for 10 minutes..."
+        # Wait a bit - 10minutes
+        sleep 600
+
+        echo "Waiting for all deployments to rollout..."
+
+        kubectl get deploy -n ${NAMESPACE_NAME} -o name
+        sleep 5
+
+        kubectl rollout status deployment -n ${NAMESPACE_NAME} --timeout=300s
+        output=$?
+
+        echo "Deployment exit code: $output"
+
+        if [ $output -ne 0 ]; then
+          echo " Deployment not healthy"
+          echo "Uninstalling Deployment"
+          exit 1
+        else
+          kubectl get pods -o jsonpath="{range .items[*]}{.metadata.name}{': '}{.spec.containers[*].image}{'\n'}{end}" -n ${NAMESPACE_NAME} | grep -v kafka
+          echo " Deployment successful and stable"
+        fi
+
+
+        # Preparing imagetag.txt
+        echo "Preparing schedule-sanity-imagetag.txt"
+      
+        FILE_PATH="${CI_PROJECT_DIR}/.gitlab/ci/schedule-sanity-imagetag.txt"
+
+        sed -i '/^#/! s#\(opnms3ps-platform/\)[^/]*/\(.*:\).*#\1'"${SANITY_PHASE_NAME}"'/\2'"${FINAL_TAG}"'#' "$FILE_PATH"
+
+      
+        # Find existing package
+        echo "Checking for existing package"
+      
+
+        PACKAGE_ID=$(curl --silent \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages?package_name=${PACKAGE_NAME}" |
+          jq -r '.[0].id')
+
+        if [ -n "$PACKAGE_ID" ] && [ "$PACKAGE_ID" != "null" ]; then
+          echo "Existing package found. Package ID: $PACKAGE_ID"
+          echo "Deleting package..."
+
+          curl --request DELETE \
+            --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/${PACKAGE_ID}"
+
+          echo "Package deleted successfully."
+        else
+          echo "No existing package found. Skipping delete."
+        fi
+
+        echo ""
+      
+        echo "Uploading Package"
+      
+
+        curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "${FILE_PATH}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${PACKAGE_VERSION}/schedule-sanity-imagetag.txt"
+
+        echo ""
+        echo "PACKAGE UPLOADED SUCCESSFULLY"
+        echo ""
+
+        echo "============================================================"
+        echo "Download Command"
+        echo "============================================================"
+
+        echo "curl --location \\"
+        echo "  --header 'PRIVATE-TOKEN: <your-token>' \\"
+        echo "  '${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${PACKAGE_VERSION}/schedule-sanity-imagetag.txt' \\"
+        echo "  -o schedule-sanity-imagetag.txt"
+
+        echo "============================================================"
+
+        
+        #Fetching ingress
+        echo "Fetching Ingress URL"
+        INGRESS_HOST=$(kubectl get ingress -n "${NAMESPACE_NAME}" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+    
+        APP_URL="https://${INGRESS_HOST}"
+
+        echo "_________________________________________________________________________"
+        echo ""
+        echo "Sanity testing URL: $APP_URL"
+        echo ""
+        echo "_________________________________________________________________________"
+        
+        echo "APP_URL =$APP_URL"  >> "${CI_PROJECT_DIR}/build.env"
+
+  artifacts:
+    reports:
+      dotenv: build.env
+
+
+      
+.sonar:
+  stage: sonar
+  <<: *schedule-rules
+  needs:
+    - job: prepare:tag
+      artifacts: true
+  before_script: []   # skip docker login
+  tags:
+    - shell-runner
+  script:
+  - |
+ 
+    REPO_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_NAMESPACE}/${REPO_SLUG}.git"
+    SSANITY_SERVICE_BRANCH="${SSANITY_SERVICE_BRANCH}"
+    echo "Cloning ${CI_PROJECT_NAMESPACE}/${REPO_SLUG} @ ${SANITY_SERVICE_BRANCH} ..."
+    git clone \
+      --depth 1 \
+      --branch "${SANITY_SERVICE_BRANCH}" \
+      "$REPO_URL" \
+      repo
+    echo "HEAD: $(git -C repo rev-parse --short HEAD)"
+
+    cd repo
+
+    # Dynamic extraction
+    SONAR_NAME="${REPO_SLUG}"
+    SONAR_KEY="${REPO_SLUG##*-}"
+
+
+
+    if [ -f "pom.xml" ]; then
+        echo " Java project detected"
+
+        # Using HOST Maven
+        export MAVEN_HOME="/usr/share/maven"
+        export JAVA_HOME="/usr/lib/jvm/java-21-amazon-corretto.x86_64"
+        export PATH="$JAVA_HOME/bin:$MAVEN_HOME/bin:$PATH"
+
+        mvn clean verify sonar:sonar -DskipTests \
+          -Dsonar.projectKey="${SONAR_KEY}" \
+          -Dsonar.projectName="${SONAR_NAME}" \
+          -Dsonar.host.url="${SONAR_HOST_URL}" \
+          -Dsonar.login="${SONAR_TOKEN}"
+
+      else
+        echo " Non-Java project detected"
+
+        sonar-scanner \
+          -Dsonar.projectKey="${SONAR_KEY}" \
+          -Dsonar.projectName="${SONAR_NAME}" \
+          -Dsonar.exclusions=**/*.java \
+          -Dsonar.host.url="${SONAR_HOST_URL}" \
+          -Dsonar.login="${SONAR_TOKEN}" \
+          ${SONAR_EXTRA_ARGS}
+      fi
+
+      echo ">>> SonarQube report generation"
+
+      PS=500
+      PAGE=1
+      COLLECTED=0
+
+      mkdir -p reports
+      # initialize json file
+      : > reports/issues.json
+
+      PS=500
+      PAGE=1
+      COLLECTED=0
+
+      while true; do
+        RESPONSE=$(curl -s -H "Authorization: Bearer $SONAR_TOKEN" \
+          "${SONAR_HOST_URL%/}/api/issues/search?componentKeys=$SONAR_KEY&resolved=false&types=BUG,CODE_SMELL,VULNERABILITY&ps=$PS&p=$PAGE")
+
+        TOTAL=$(echo "$RESPONSE" | jq '.paging.total')
+        COUNT=$(echo "$RESPONSE" | jq '.issues | length')
+
+        echo "$RESPONSE" | jq -c '.issues[]' >> reports/issues.json
+
+        COLLECTED=$((COLLECTED + COUNT))
+        echo "Fetched $COLLECTED / $TOTAL issues"
+
+        [ "$COLLECTED" -ge "$TOTAL" ] && break
+        PAGE=$((PAGE + 1))
+      done
+
+
+      jq -n -r '
+        (["key","rule","type","severity","component","line","message"] | @csv),
+        (inputs | [
+          .key,
+          .rule,
+          .type,
+          .severity,
+          .component,
+          (.line // ""),
+          (.message // "" | gsub("\n"; " "))
+        ] | @csv)
+      ' reports/issues.json >> reports/issues.csv
+
+      ISSUES_JSON="reports/issues.json"
+
+      BLOCKER=$(jq -c 'select(.severity=="BLOCKER")'  "$ISSUES_JSON" | wc -l)
+      CRITICAL=$(jq -c 'select(.severity=="CRITICAL")' "$ISSUES_JSON" | wc -l)
+      MAJOR=$(jq -c 'select(.severity=="MAJOR")'    "$ISSUES_JSON" | wc -l)
+      MINOR=$(jq -c 'select(.severity=="MINOR")'    "$ISSUES_JSON" | wc -l)
+      INFO=$(jq -c 'select(.severity=="INFO")'     "$ISSUES_JSON" | wc -l)
+
+      TOTAL=$((BLOCKER + CRITICAL + MAJOR + MINOR + INFO))
+
+      
+      echo "-----------------------------------------"
+      echo " SonarQube Overall Issues (GUI Match)"
+      echo "-----------------------------------------"
+      echo " TOTAL:     $TOTAL"
+      echo " BLOCKER:  $BLOCKER"
+      echo " CRITICAL: $CRITICAL"
+      echo " MAJOR:    $MAJOR"
+      echo " MINOR:    $MINOR"
+      echo " INFO:     $INFO"
+      echo "-----------------------------------------"
+
+
+      SUMMARY_FILE="reports/summary-$REPO_SLUG.txt"
+      
+      echo "-----------------------------------------" >> "$SUMMARY_FILE"
+      echo " SERVICE: $REPO_SLUG" >> "$SUMMARY_FILE"
+      echo "-----------------------------------------" >> "$SUMMARY_FILE"
+      echo " TOTAL:     $TOTAL" >> "$SUMMARY_FILE"
+      echo " BLOCKER:   $BLOCKER" >> "$SUMMARY_FILE"
+      echo " CRITICAL:  $CRITICAL" >> "$SUMMARY_FILE"
+      echo " MAJOR:     $MAJOR" >> "$SUMMARY_FILE"
+      echo " MINOR:     $MINOR" >> "$SUMMARY_FILE"
+      echo " INFO:      $INFO" >> "$SUMMARY_FILE"
+      echo "" >> "$SUMMARY_FILE"
+
+
+
+  artifacts:
+    when: always
+    name: "SonarQube-Report"
+    paths:
+      - repo/reports/
+    expire_in: 10 days
+
+
+sonar:service-agw:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-agw
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+sonar:service-aus:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-aus
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+sonar:service-cfm:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-cfm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+sonar:service-ewi:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-ewi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+sonar:service-nem:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-nem
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone  
+
+sonar:service-wbs:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-wbs
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+    SONAR_EXTRA_ARGS: "-Dsonar.sources=wbs -Dsonar.tests=wbs/__tests__"
+    
+
+sonar:service-wui:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-wui
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+sonar:service-rpm:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-rpm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+sonar:service-nbi:
+  extends: .sonar
+  variables:
+    REPO_SLUG:  opnms3ps-nbi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+
+merge-sonar-reports:
+  stage: sonar
+  <<: *schedule-rules
+  needs:
+    - job: sonar:service-agw
+      artifacts: true
+      optional: true
+    - job: sonar:service-aus
+      artifacts: true
+      optional: true
+    - job: sonar:service-cfm
+      artifacts: true
+      optional: true
+    - job: sonar:service-ewi
+      artifacts: true
+      optional: true
+    - job: sonar:service-nem
+      artifacts: true
+      optional: true
+    - job: sonar:service-wbs
+      artifacts: true
+      optional: true
+    - job: sonar:service-wui
+      artifacts: true
+      optional: true
+    - job: sonar:service-rpm
+      artifacts: true
+      optional: true
+    - job: sonar:service-nbi
+      artifacts: true
+      optional: true
+
+  script:
+    - |
+      
+      mkdir -p final-report
+      > final-report/sonar-summary.txt
+
+      echo "Merging all summaries..."
+
+      if ! find repo/reports -type f -name "summary-*.txt" -print -quit 2>/dev/null | grep -q .; then
+        echo "Warning: No sonar reports found. All upstream jobs may have been skipped."
+        echo "No reports available" > final-report/sonar-summary.txt
+        exit 0
+      fi
+
+
+
+      find repo/reports -name "summary-*.txt" -exec cat {} \; >> final-report/sonar-summary.txt
+
+      echo "Final Combined Report:"
+      cat final-report/sonar-summary.txt
+
+      {
+      echo "SERVICE,TOTAL,BLOCKER,CRITICAL,MAJOR,MINOR,INFO"
+
+      sed -n '
+        s/^ *SERVICE: *//p
+        s/^ *TOTAL: *//p
+        s/^ *BLOCKER: *//p
+        s/^ *CRITICAL: *//p
+        s/^ *MAJOR: *//p
+        s/^ *MINOR: *//p
+        s/^ *INFO: *//p
+      ' final-report/sonar-summary.txt | paste -d',' - - - - - - -
+      } > final-report/summary.csv
+
+  artifacts:
+    paths:
+      - final-report/summary.csv
+    expire_in: 10 days
+
+
+
+trigger_qa_pipeline:
+  stage: trigger_qa
+  <<: *schedule-rules  
+  needs:
+    - job: deploy:helm
+      artifacts: true
+  trigger:
+    project: connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-aqa
+    branch: main
+    strategy: depend
+  variables:
+    # PLATFORM_TRIGGER: "trigger-aqa"
+    APP_URL: $APP_URL
+	
+
+
+/nem/mr/trivy-scan.yaml
+
+variables:
+  GIT_STRATEGY: fetch
+  GIT_CLEAN_FLAGS: -ffdx
+
+trivy-scan:
+  stage: trivy-scan
+  tags:
+    - docker
+    - $RUNNER_TAG
+  # ensures no stage blocking
+  needs: []
+  
+  image: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+  services:
+    - name: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+      alias: docker
+
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+
+    #  Never run in any other case
+    - when: never
+  
+
+  variables:
+    IMAGE_NAME: "local-test-image"
+    IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+    FULL_IMAGE: "${IMAGE_NAME}:${IMAGE_TAG}"
+
+    TRIVY_CACHE_DIR: ".trivycache/"
+    TRIVY_SEVERITY: "CRITICAL,HIGH,MEDIUM"
+    TRIVY_TIMEOUT: "5m"
+
+  script:
+    - |
+      #  Install Trivy
+      apk add --no-cache curl
+      curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+      mv ./bin/trivy /usr/local/bin/trivy
+
+      trivy --version
+
+      mkdir -p .trivy/templates
+      curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl -o .trivy/templates/html.tpl
+
+
+      #  1. Trivy FS Scan
+      echo "Running Trivy FS scan..."
+      trivy fs . \
+        --offline-scan \
+        --severity ${TRIVY_SEVERITY} \
+        --exit-code ${TRIVY_EXIT_CODE:-0} \
+        --cache-dir ${TRIVY_CACHE_DIR} \
+        --timeout ${TRIVY_TIMEOUT} \
+        --format json \
+        --output trivy-fs-report.json
+      echo "FS scan completed"
+
+      # HTML report
+      trivy fs . \
+        --offline-scan \
+        --severity ${TRIVY_SEVERITY} \
+        --cache-dir ${TRIVY_CACHE_DIR} \
+        --timeout ${TRIVY_TIMEOUT} \
+        --format template \
+        --template "@.trivy/templates/html.tpl" \
+        --output trivy-fs-report.html
+
+
+      echo "Trivy FS scan completed"
+
+      echo "Checking for Dockerfile to perform Trivy image scan..."
+
+      if [ -f "$CI_PROJECT_DIR/Dockerfile" ]; then
+
+        echo "Dockerfile found. Starting Docker build..."
+
+        # Build Docker Image
+        docker build -t ${FULL_IMAGE} $CI_PROJECT_DIR
+
+        if [ $? -ne 0 ]; then
+          echo "Docker build failed, hence pipeline FAILED"
+          exit 1
+        fi
+
+        echo "Running Trivy Image scan..."
+
+        # JSON Report
+        trivy image ${FULL_IMAGE} \
+          --exit-code ${TRIVY_EXIT_CODE:-0} \
+          --severity ${TRIVY_SEVERITY} \
+          --cache-dir ${TRIVY_CACHE_DIR} \
+          --timeout ${TRIVY_TIMEOUT} \
+          --format json \
+          --output trivy-report.json
+
+        # HTML Report
+        trivy image ${FULL_IMAGE} \
+          --severity ${TRIVY_SEVERITY} \
+          --cache-dir ${TRIVY_CACHE_DIR} \
+          --timeout ${TRIVY_TIMEOUT} \
+          --format template \
+          --template "@.trivy/templates/html.tpl" \
+          --output trivy-report.html
+
+
+        echo "Trivy FS + Image scan completed"
+
+      else
+        echo "No Dockerfile found in repository. So Skipping Trivy Image Scan."
+      fi
+
+  artifacts:
+    when: always
+    paths:
+      - trivy-fs-report.json
+      - trivy-fs-report.html
+      - trivy-report.json
+      - trivy-report.html
+      
+    expire_in: 30 days
+
+  cache:
+    key: trivy-db-cache
+    paths:
+      - .trivycache/
+
+  
+  
+/nem/mr/ut.yaml
+variables:
+  GIT_STRATEGY: clean
+  GIT_CLEAN_FLAGS: -ffdx
+  
+unit_test:
+  stage: ut
+  tags:
+    - docker
+    - $RUNNER_TAG
+  image: maven:3.9.9-eclipse-temurin-21
+  rules:
+    #  Run ONLY for MR to main AND run even if previous jobs fail
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: always
+
+    #  Never run in any other case (commits, schedules, etc.)
+    - when: never
+  #  ensures no stage blocking
+  needs: []
+  timeout: 30 minutes 
+  script:
+    - |
+      #export MAVEN_HOME="/usr/share/maven"
+      #export JAVA_HOME="/usr/lib/jvm/java-21-amazon-corretto.x86_64"
+      #export PATH="$JAVA_HOME/bin:$MAVEN_HOME/bin:$PATH"
+
+               
+      # -------------------------------
+      # Step 1: Run tests (don't fail immediately)
+      # -------------------------------
+      #set +e
+      echo "Branch name : $CI_COMMIT_REF_NAME"
+      echo "Running Unit Tests..."
+      export MAVEN_OPTS="-Xms512m -Xmx4g"
+      mvn clean verify -Dmaven.test.failure.ignore=true
+
+      # restore failure behavior
+      #set -e
+
+      # -------------------------------
+      # Step 2: Generate JaCoCo report
+      # -------------------------------
+      #mvn jacoco:report
+
+      # Step 3: Generate ONE consolidated test result
+      echo ""
+      echo "================ TEST SUMMARY ================"
+
+      # Ensure reports exist
+      if ls target/surefire-reports/*.xml >/dev/null 2>&1; then
+
+        TOTAL_TESTS=$(grep -h '<testsuite ' target/surefire-reports/*.xml \
+          | sed -n 's/.*tests="\([0-9]*\)".*/\1/p' \
+          | awk '{s+=$1} END {print s}')
+
+        TOTAL_FAILURES=$(grep -h '<testsuite ' target/surefire-reports/*.xml \
+          | sed -n 's/.*failures="\([0-9]*\)".*/\1/p' \
+          | awk '{s+=$1} END {print s}')
+
+        TOTAL_ERRORS=$(grep -h '<testsuite ' target/surefire-reports/*.xml \
+          | sed -n 's/.*errors="\([0-9]*\)".*/\1/p' \
+          | awk '{s+=$1} END {print s}')
+
+        TOTAL_SKIPPED=$(grep -h '<testsuite ' target/surefire-reports/*.xml \
+         | sed -n 's/.*skipped="\([0-9]*\)".*/\1/p' \
+         | awk '{s+=$1} END {print s}')
+
+      else
+        echo "No test reports found!"
+      fi
+
+      echo "Total Tests   : $TOTAL_TESTS"
+      echo "Failures      : $TOTAL_FAILURES"
+      echo "Errors        : $TOTAL_ERRORS"
+      echo "Skipped       : $TOTAL_SKIPPED"
+     
+      
+
+           
+      # -------------------------------
+      # Step 4: Extract Coverage
+      # -------------------------------
+      
+
+      JACOCO_HTML="target/site/jacoco/index.html"
+
+      if [ ! -f "$JACOCO_HTML" ]; then
+        echo " index.html not found!"
+        exit 1
+      fi
+
+      
+      # Extract TOTAL coverage % (JaCoCo table)
+      COVERAGE=$(grep -oP 'Total.*?\K\d+(?=%)' "$JACOCO_HTML" | head -1)
+
+
+      if [ -z "$COVERAGE" ]; then
+        echo " Unable to extract coverage from HTML"
+        exit 1
+      fi
+      
+      echo "Coverage (%)  : $COVERAGE"
+      echo "=============================================="
+
+      MIN_COVERAGE=85
+
+      
+      # -------------------------------
+      # Step 5: Final Decision (COMBINED)
+      # ------------------------------
+      
+      PIPELINE_FAILED=0
+
+      #  Test failure condition
+      if [ "$TOTAL_FAILURES" -ne 0 ] || [ "$TOTAL_ERRORS" -ne 0 ]; then
+          echo " Unit Test failures/errors detected"
+          PIPELINE_FAILED=1
+        
+      else
+        echo " All Unit Tests passed"
+      fi
+
+      #  Coverage condition
+      if [ "$COVERAGE" -lt "$MIN_COVERAGE" ]; then
+        echo "Code coverage is below threshold (${MIN_COVERAGE}%), hence pipeline failed"
+        PIPELINE_FAILED=1
+        
+      else
+        echo " Code coverage meets threshold(≥ 85%) "
+      fi
+
+      # -------------------------------
+      # Step 6:  Final pipeline status
+      # -------------------------------
+      if [ "$PIPELINE_FAILED" -eq 1 ]; then
+        echo "PIPELINE FAILED"
+        exit 1
+      else
+        echo "PIPELINE PASSED"
+      fi
+
+      echo "==================================="
+
+
+  artifacts:
+    when: always
+    name: "UnitTest-Report"
+    paths:
+      - target/site/jacoco/
+      - target/surefire-reports/
+    reports:
+      junit: target/surefire-reports/*.xml
+    expire_in: 1 week
+
+    
+
+
+/nem/mr/sast.yaml
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+variables:
+  SECURE_LOG_LEVEL: debug
+  COMPILE: "false"        # cancelling spotbugs compile as it have java compatibility issue
+ 
+
+semgrep-sast:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+    - when: never
+  needs: []
+  tags:
+    - docker
+    - $RUNNER_TAG
+  after_script:
+  - apk add --no-cache jq
+
+  - |
+      if [ ! -f gl-sast-report.json ]; then
+        echo "gl-sast-report.json not found. Skipping CSV generation."
+        exit 0
+      fi
+  - |
+      {
+        echo '"Severity","Title","File","Line","Scanner","CVE"'
+        jq -r '
+          .vulnerabilities[]
+          | [
+              (.severity // ""),
+              (.name // ""),
+              (.location.file // ""),
+              (.location.start_line // ""),
+              (.scanner.name // ""),
+              (
+                [.identifiers[]?.value]
+                | join("; ")
+              )
+            ]
+          | @csv
+        ' gl-sast-report.json
+      } > semgrep-report.csv
+
+  artifacts:
+    paths:
+      - semgrep-report.csv
+      - gl-sast-report.json
+
+spotbugs-sast:
+  rules:
+    - exists:
+        - pom.xml
+      if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+
+    #  Never run in any other case
+    - when: never
+  needs:
+    - job: sast-build
+      artifacts: true
+  tags:
+    - docker
+    - $RUNNER_TAG
+  after_script:
+  - apk add --no-cache jq
+  - |
+      if [ ! -f gl-sast-report.json ]; then
+        echo "gl-sast-report.json not found. Skipping CSV generation."
+        exit 0
+      fi
+  - |
+      {
+        echo '"Severity","Title","File","Line","Scanner","CVE"'
+        jq -r '
+          .vulnerabilities[]
+          | [
+              (.severity // ""),
+              (.name // ""),
+              (.location.file // ""),
+              (.location.start_line // ""),
+              (.scanner.name // "Find Security Bugs"),
+              (
+                [.identifiers[]?.value]
+                | join("; ")
+              )
+            ]
+          | @csv
+        ' gl-sast-report.json
+      } > spotbugs-report.csv
+
+  artifacts:
+    paths:
+      - spotbugs-report.csv
+      - gl-sast-report.json
+
+
+sast-build:
+  stage: sast-build
+  image: maven:3.9.9-eclipse-temurin-21   # using java 21 version
+  tags:
+    - docker
+    - $RUNNER_TAG
+  needs: []
+  rules:
+    - exists:
+        - pom.xml
+      if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+
+    #  Never run in any other case
+    - when: never
+  script:
+    - export MAVEN_OPTS="-Xms512m -Xmx4g"
+    - mvn clean package -DskipTests          # compiling here separately as spotbugs having java compatibility issue
+  artifacts:
+    paths:
+      - target/classes
+    expire_in: 1h
+
+
+
+
+
+/nem/mr/sanity.yaml
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+variables:
+  SECURE_LOG_LEVEL: debug
+  COMPILE: "false"        # cancelling spotbugs compile as it have java compatibility issue
+ 
+
+semgrep-sast:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+    - when: never
+  needs: []
+  tags:
+    - docker
+    - $RUNNER_TAG
+  after_script:
+  - apk add --no-cache jq
+
+  - |
+      if [ ! -f gl-sast-report.json ]; then
+        echo "gl-sast-report.json not found. Skipping CSV generation."
+        exit 0
+      fi
+  - |
+      {
+        echo '"Severity","Title","File","Line","Scanner","CVE"'
+        jq -r '
+          .vulnerabilities[]
+          | [
+              (.severity // ""),
+              (.name // ""),
+              (.location.file // ""),
+              (.location.start_line // ""),
+              (.scanner.name // ""),
+              (
+                [.identifiers[]?.value]
+                | join("; ")
+              )
+            ]
+          | @csv
+        ' gl-sast-report.json
+      } > semgrep-report.csv
+
+  artifacts:
+    paths:
+      - semgrep-report.csv
+      - gl-sast-report.json
+
+spotbugs-sast:
+  rules:
+    - exists:
+        - pom.xml
+      if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+
+    #  Never run in any other case
+    - when: never
+  needs:
+    - job: sast-build
+      artifacts: true
+  tags:
+    - docker
+    - $RUNNER_TAG
+  after_script:
+  - apk add --no-cache jq
+  - |
+      if [ ! -f gl-sast-report.json ]; then
+        echo "gl-sast-report.json not found. Skipping CSV generation."
+        exit 0
+      fi
+  - |
+      {
+        echo '"Severity","Title","File","Line","Scanner","CVE"'
+        jq -r '
+          .vulnerabilities[]
+          | [
+              (.severity // ""),
+              (.name // ""),
+              (.location.file // ""),
+              (.location.start_line // ""),
+              (.scanner.name // "Find Security Bugs"),
+              (
+                [.identifiers[]?.value]
+                | join("; ")
+              )
+            ]
+          | @csv
+        ' gl-sast-report.json
+      } > spotbugs-report.csv
+
+  artifacts:
+    paths:
+      - spotbugs-report.csv
+      - gl-sast-report.json
+
+
+sast-build:
+  stage: sast-build
+  image: maven:3.9.9-eclipse-temurin-21   # using java 21 version
+  tags:
+    - docker
+    - $RUNNER_TAG
+  needs: []
+  rules:
+    - exists:
+        - pom.xml
+      if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+
+    #  Never run in any other case
+    - when: never
+  script:
+    - export MAVEN_OPTS="-Xms512m -Xmx4g"
+    - mvn clean package -DskipTests          # compiling here separately as spotbugs having java compatibility issue
+  artifacts:
+    paths:
+      - target/classes
+    expire_in: 1h
+
+
+
+
+
+
+
+/nem/mr/sonar.yaml
+variables:
+  GIT_STRATEGY: fetch
+  GIT_CLEAN_FLAGS: -ffdx
+  
+# ==========================================================
+# JAVA SCAN (Shell Runner + Host Maven)
+# ==========================================================
+.sonar_scan_java:
+  stage: scan
+  image: maven:3.9-eclipse-temurin-21
+  tags:
+    - docker
+    - $RUNNER_TAG
+  
+  rules:
+    #  Run ONLY for Java projects (pom.xml present)
+    - exists:
+        - pom.xml
+      if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+
+    #  Never run in any other case
+    - when: never
+
+  interruptible: true
+  script:
+    - |
+      cd "$CI_PROJECT_DIR"
+
+      # Run Maven + Sonar with debug logs
+      mvn clean verify sonar:sonar -DskipTests \
+        -Dsonar.projectKey="${SONAR_KEY}" \
+        -Dsonar.projectName="${SONAR_NAME}" \
+        -Dsonar.host.url="${SONAR_ENT_HOST_URL}" \
+        -Dsonar.token="${SONAR_ENT_TOKEN}" \
+        -Dsonar.branch.name="${CI_COMMIT_REF_NAME}"
+
+# ==========================================================
+# NON-JAVA SCAN (Docker Image with SonarScanner)
+# ==========================================================
+.sonar_scan_non_java:
+  stage: scan
+  image: sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1
+  tags:
+    - docker
+    - $RUNNER_TAG
+  
+  rules:
+    #  Do not run for Java projects
+    - exists:
+        - pom.xml
+      when: never
+
+    #  Run ONLY when MR is raised
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+
+    #  Never run in any other case (commits, schedules, etc.)
+    - when: never
+
+
+  script:
+    - |     
+
+      echo "Non-Java project detected"     
+
+      cd "$CI_PROJECT_DIR"
+
+      sonar-scanner \
+        -Dsonar.projectKey="${SONAR_KEY}" \
+        -Dsonar.projectName="${SONAR_NAME}" \
+        -Dsonar.exclusions=**/*.java \
+        -Dsonar.host.url="${SONAR_ENT_HOST_URL}" \
+        -Dsonar.token="${SONAR_ENT_TOKEN}" \
+        -Dsonar.branch.name="${CI_COMMIT_REF_NAME}"
+    
+      
+
+# ==========================================================
+# REPORT + QUALITY GATE (JSON → CSV + Threshold)
+# ==========================================================
+.sonarqube_report:
+  stage: report
+  image: alpine:3.20
+  tags:
+    - docker
+    - $RUNNER_TAG
+  before_script:
+    - apk add --no-cache curl jq
+ 
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+      when: on_success
+    - when: never
+  needs:
+    - job: scan:nem
+      optional: true
+      
+    - job: scan:nem:nonjava
+      optional: true
+ 
+  script:
+    - |
+        set -euo pipefail
+        echo ">>> SonarQube report (pagination + NDJSON)"
+        PS=500
+        PAGE=1
+        COLLECTED=0
+        mkdir -p reports
+        : > reports/issues.json
+
+        while true; do
+          RESPONSE=$(curl -s -H "Authorization: Bearer $SONAR_ENT_TOKEN" \
+            "${SONAR_ENT_HOST_URL%/}/api/issues/search?componentKeys=$SONAR_KEY&branch=${CI_COMMIT_REF_NAME}&resolved=false&types=BUG,CODE_SMELL,VULNERABILITY&ps=$PS&p=$PAGE")
+
+          TOTAL=$(echo "$RESPONSE" | jq '.paging.total')
+          COUNT=$(echo "$RESPONSE" | jq '.issues | length')
+
+          echo "$RESPONSE" | jq -c '.issues[]' >> reports/issues.json
+
+          COLLECTED=$((COLLECTED + COUNT))
+          echo "Fetched $COLLECTED / $TOTAL issues"
+
+          [ "$COLLECTED" -ge "$TOTAL" ] && break
+          PAGE=$((PAGE + 1))
+        done
+
+        # NDJSON -> CSV (header once)
+        jq -n -r '
+          (["key","rule","type","severity","component","line","message"] | @csv),
+          (inputs | [
+            .key,
+            .rule,
+            .type,
+            .severity,
+            .component,
+            (.line // ""),
+            (.message // "" | gsub("\n"; " "))
+          ] | @csv)
+        ' reports/issues.json > reports/issues.csv
+
+        ISSUES_JSON="reports/issues.json"
+
+        BLOCKER=$(jq -c 'select(.severity=="BLOCKER")'  "$ISSUES_JSON" | wc -l)
+        CRITICAL=$(jq -c 'select(.severity=="CRITICAL")' "$ISSUES_JSON" | wc -l)
+        MAJOR=$(jq -c 'select(.severity=="MAJOR")'    "$ISSUES_JSON" | wc -l)
+        MINOR=$(jq -c 'select(.severity=="MINOR")'    "$ISSUES_JSON" | wc -l)
+        INFO=$(jq -c 'select(.severity=="INFO")'     "$ISSUES_JSON" | wc -l)
+
+        TOTAL=$((BLOCKER + CRITICAL + MAJOR + MINOR + INFO))
+
+        echo "-----------------------------------------"
+        echo " SonarQube Overall Issues (GUI Match)"
+        echo "-----------------------------------------"
+        echo " TOTAL:     $TOTAL"
+        echo " BLOCKER:  $BLOCKER"
+        echo " CRITICAL: $CRITICAL"
+        echo " MAJOR:    $MAJOR"
+        echo " MINOR:    $MINOR"
+        echo " INFO:     $INFO"
+        echo "-----------------------------------------"
+
+        # -------------------------------
+        # 4) QUALITY GATE
+        # -------------------------------
+        
+        MAX_MINOR=20
+
+        if [ "$BLOCKER" -ne 0 ] || \
+             [ "$CRITICAL" -ne 0 ] || \
+             [ "$MAJOR" -ne 0 ] || \
+             [ "$MINOR" -gt "$MAX_MINOR" ]; then
+
+
+            echo "Merge blocked due to quality gate failure:"
+
+            echo "   Merge blocked due to quality gate failure:"
+            echo "   BLOCKER=$BLOCKER (must be 0)"
+            echo "   CRITICAL=$CRITICAL (must be 0)"
+            echo "   MAJOR=$MAJOR (must be 0)"
+            echo "   MINOR=$MINOR (must be ≤ $MAX_MINOR)"
+            exit 1
+        else
+          echo "Quality gate passed. Please proceed with Merge Request"
+        fi
+
+  artifacts:
+    when: always
+    name: "SonarQube-Report"
+    paths:
+      - reports/
+    expire_in: 10 days
+
+
+
+scan:nem:
+  extends: .sonar_scan_java
+  needs: []        #  breaks dependency on build
+  variables:
+    SONAR_KEY: "nem"
+    SONAR_NAME: "opnms3ps-nem"
+
+scan:nem:nonjava:
+  extends: .sonar_scan_non_java
+  needs: []        #  breaks dependency on build
+  variables:
+    SONAR_KEY: "nem"
+    SONAR_NAME: "opnms3ps-nem"
+
+sonarqube-report:nem:
+  extends: .sonarqube_report
+  variables:
+    SONAR_KEY: "nem"
+    SONAR_NAME: "opnms3ps-nem"
+
+
+
+
+
+/nem/mp/build-mp.yaml
+
+variables:
+  # GIT_STRATEGY: clean
+  # GIT_CLEAN_FLAGS: -ffdx
+
+  # Base registry path (Platform repo)
+  BASE_TARGET_REGISTRY: "registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform"
+
+  DOCKERFILE_PATH: "."  # path in repo where Dockerfile exists
+
+mp_build_push_image:
+  stage: build_mp
+  image: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+  tags:
+    - docker
+    - $RUNNER_TAG
+  rules:
+    # Block execution on main branch
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: never
+    # Trigger pipeline when click New Pipeline
+    - if: '$CI_PIPELINE_SOURCE == "web" && ($RUN_JOB == "build-only" || $RUN_JOB == "both")'
+      when: on_success    
+    # Default: do not run
+    - when: never
+
+  before_script: 
+    - |
+      if ! echo "$BUILD_PUSH_TOKEN_PASS" | docker login --username "$BUILD_PUSH_TOKEN_USER" --password-stdin registry-gitlab-ultimate.engine.capgemini.com; then
+        echo "Error: Docker login failed"
+        exit 1
+      fi
+      echo "Docker login success"
+      
+
+  script:
+    - |
+      echo " Preparing variables..."
+
+      # Extract application folder name
+      APP_NAME=$(basename "$CI_PROJECT_PATH")
+      echo "Detected application/repo name: $APP_NAME"
+
+      TARGET_IMAGE="$BASE_TARGET_REGISTRY/build_mp/$APP_NAME"
+      echo "Target image: $TARGET_IMAGE"
+
+      echo " Moving to Dockerfile path: $DOCKERFILE_PATH"
+      cd "$CI_PROJECT_DIR/$DOCKERFILE_PATH"
+
+      # Validate Dockerfile
+      test -f Dockerfile || (echo " ERROR: Dockerfile not found" && exit 1)
+
+      # --------------------------------------------------------------------
+      # Tag Logic:
+      # - main branch: shortSHA
+      # - other branches: branch-shortSHA
+
+      # --------------------------------------------------------------------
+      
+      SHORT_SHA=$(echo "$CI_COMMIT_SHA" | cut -c1-8)
+      BRANCH_TAG=$(echo "$CI_COMMIT_REF_NAME" | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+      COMBINED_TAG="${BRANCH_TAG}-${SHORT_SHA}"
+
+      echo "Final tags to be created:"
+      echo "   → $COMBINED_TAG"
+      
+
+      # --------------------------------------------------------------------
+      # Build docker image
+      # --------------------------------------------------------------------
+      echo "Building Docker image..."
+      docker build -t "$TARGET_IMAGE:$COMBINED_TAG" .
+
+      # Push branch-commit tag
+      echo " Pushing branch tag: $COMBINED_TAG ..."
+      docker push "$TARGET_IMAGE:$COMBINED_TAG"
+
+      FULL_IMAGE_PATH="$TARGET_IMAGE:$COMBINED_TAG"
+
+      echo " "
+      echo "--------------------------------------------------------------------"
+      echo "Image path : $FULL_IMAGE_PATH"
+      echo "--------------------------------------------------------------------"
+      echo " "
+
+
+
+
+
+
+/nem/mp/sonar-mp.yaml
+variables:
+    # GIT_STRATEGY: fetch
+    # GIT_CLEAN_FLAGS: -ffdx
+    SONAR_KEY: "nem"
+    SONAR_NAME: "opnms3ps-nem"
+# ==========================================================
+# SINGLE SCAN JOB (AUTO-DETECT JAVA / NON-JAVA)
+# ==========================================================
+sonar_scan:nem-mp:
+  stage: scan_mp
+  tags:
+    - shell-runner
+  
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && ($RUN_JOB == "sonar-only" || $RUN_JOB == "both")'
+      when: on_success
+    - when: never
+
+  script:
+    - |
+      set -euo pipefail
+
+      cd "$CI_PROJECT_DIR"
+
+      echo ">>> Detecting project type..."
+
+      if [ -f "pom.xml" ]; then
+        echo " Java project detected"
+
+        # Using HOST Maven
+        export MAVEN_HOME="/usr/share/maven"
+        export JAVA_HOME="/usr/lib/jvm/java-21-amazon-corretto.x86_64"
+        export PATH="$JAVA_HOME/bin:$MAVEN_HOME/bin:$PATH"
+
+        mvn clean verify sonar:sonar -DskipTests \
+          -Dsonar.projectKey="${SONAR_KEY}" \
+          -Dsonar.projectName="${SONAR_NAME}" \
+          -Dsonar.host.url="${SONAR_HOST_URL}" \
+          -Dsonar.login="${SONAR_TOKEN}"
+
+      else
+        echo " Non-Java project detected"
+
+        sonar-scanner \
+          -Dsonar.projectKey="${SONAR_KEY}" \
+          -Dsonar.projectName="${SONAR_NAME}" \
+          -Dsonar.exclusions=**/*.java \
+          -Dsonar.host.url="${SONAR_HOST_URL}" \
+          -Dsonar.login="${SONAR_TOKEN}"
+      fi
+
+  
+
+
+# ==========================================================
+# REPORT JOB
+# ==========================================================
+sonarqube-report:nem-mp:
+  stage: report_mp
+  image: alpine:3.20
+  tags:
+    - docker
+    - $RUNNER_TAG
+  before_script:
+    - apk add --no-cache curl jq
+
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && ($RUN_JOB == "sonar-only" || $RUN_JOB == "both")'
+      when: on_success
+    - when: never
+
+  needs:
+    - sonar_scan:nem-mp
+
+  script:
+    - |
+      set -euo pipefail
+
+      echo ">>> SonarQube report generation"
+
+      PS=500
+      PAGE=1
+      COLLECTED=0
+      MAX_PAGES=200
+
+      mkdir -p reports
+      : > reports/issues.json
+
+      while [ "$PAGE" -le "$MAX_PAGES" ]; do
+        RESPONSE=$(curl -s -H "Authorization: Bearer $SONAR_TOKEN" \
+          "${SONAR_HOST_URL%/}/api/issues/search?componentKeys=$SONAR_KEY&resolved=false&types=BUG,CODE_SMELL,VULNERABILITY&ps=$PS&p=$PAGE")
+        
+        # Validate JSON
+        if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+          echo "Invalid JSON response from SonarQube"
+          exit 1
+        fi
+
+        # Check API errors
+        if echo "$RESPONSE" | jq -e '.errors' >/dev/null 2>&1; then
+          echo "SonarQube API returned an error:"
+          echo "$RESPONSE" | jq .
+          exit 1
+        fi  
+
+
+        TOTAL=$(echo "$RESPONSE" | jq '.paging.total')
+        COUNT=$(echo "$RESPONSE" | jq '.issues | length')
+        
+        if ! [[ "$TOTAL" =~ ^[0-9]+$ && "$COUNT" =~ ^[0-9]+$ ]]; then
+          echo "Failed to extract valid numeric values from SonarQube response"
+          exit 1
+        fi
+
+
+        
+        # Exit on empty result set
+        [ "$COUNT" -eq 0 ] && break
+
+
+        echo "$RESPONSE" | jq -c '.issues[]' >> reports/issues.json
+
+        COLLECTED=$((COLLECTED + COUNT))
+        echo "Fetched $COLLECTED / $TOTAL issues"
+
+        [ "$COLLECTED" -ge "$TOTAL" ] && break
+        PAGE=$((PAGE + 1))
+      done
+      if [ "$PAGE" -gt "$MAX_PAGES" ]; then
+        echo "Reached maximum page limit ($MAX_PAGES). Stopping pagination."
+      fi
+
+
+      jq -n -r '
+        (["key","rule","type","severity","component","line","message"] | @csv),
+        (inputs | [
+          .key,
+          .rule,
+          .type,
+          .severity,
+          .component,
+          (.line // ""),
+          (.message // "" | gsub("\n"; " "))
+        ] | @csv)
+      ' reports/issues.json > reports/issues.csv
+
+      ISSUES_JSON="reports/issues.json"
+
+      BLOCKER=$(jq -c 'select(.severity=="BLOCKER")'  "$ISSUES_JSON" | wc -l)
+      CRITICAL=$(jq -c 'select(.severity=="CRITICAL")' "$ISSUES_JSON" | wc -l)
+      MAJOR=$(jq -c 'select(.severity=="MAJOR")'    "$ISSUES_JSON" | wc -l)
+      MINOR=$(jq -c 'select(.severity=="MINOR")'    "$ISSUES_JSON" | wc -l)
+      INFO=$(jq -c 'select(.severity=="INFO")'     "$ISSUES_JSON" | wc -l)
+
+      TOTAL=$((BLOCKER + CRITICAL + MAJOR + MINOR + INFO))
+
+      echo "-----------------------------------------"
+      echo " SonarQube Overall Issues (GUI Match)"
+      echo "-----------------------------------------"
+      echo " TOTAL:     $TOTAL"
+      echo " BLOCKER:  $BLOCKER"
+      echo " CRITICAL: $CRITICAL"
+      echo " MAJOR:    $MAJOR"
+      echo " MINOR:    $MINOR"
+      echo " INFO:     $INFO"
+      echo "-----------------------------------------"
+
+  artifacts:
+    when: always
+    name: "SonarQube-Report"
+    paths:
+      - reports/
+    expire_in: 10 days
+
+
+
+
+
+/nem/.gitlab-ci.yaml
+include:
+  - local: ".gitlab/ci/build.yaml"
+  - local: ".gitlab/mr/sonar.yaml"
+  - local: ".gitlab/mr/ut.yaml"
+  - local: ".gitlab/ci/pipeline-for-nonmain.yaml"
+  - local: ".gitlab/mp/build_mp.yaml"
+  - local: ".gitlab/mp/sonar_mp.yaml"
+  - local: ".gitlab/cd/deploy-after-build.yaml"
+  - local: ".gitlab/mr/sast.yaml"
+  - local: ".gitlab/mr/trivy-scan.yaml"
+  - local: ".gitlab/mr/sanity.yaml"
+
+stages:
+  - build
+  - scan
+  - report
+  - ut
+  - non-main-mr
+  - build_mp
+  - scan_mp
+  - report_mp
+  - deploy
+  - sast-build
+  - test
+  - trivy-scan
+  - mr-sanity-trigger
+
+variables:
+  RUN_JOB:
+    value: build-only
+    description: Select pipeline type
+    options:
+    - build-only
+    - sonar-only
+    - both
+
+
+
+
+/nem/ci/buil.yaml
+variables:
+  GIT_STRATEGY: fetch
+  GIT_CLEAN_FLAGS: -ffdx
+  # Base registry path (Platform repo)
+  BASE_TARGET_REGISTRY: "registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform"
+  DOCKERFILE_PATH: "."  # path in repo where Dockerfile exists
+
+build_and_push_image:
+  stage: build
+  image: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+  tags:
+    - docker
+    - $RUNNER_TAG
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+  before_script: 
+    - |
+      if ! echo "$BUILD_PUSH_TOKEN_PASS" | docker login --username "$BUILD_PUSH_TOKEN_USER" --password-stdin registry-gitlab-ultimate.engine.capgemini.com; then
+        echo "Error: Docker login failed"
+        exit 1
+      fi
+      echo "Docker login success"
+      
+
+  script:
+    - |
+      echo " Preparing variables..."
+
+      # Extract application folder name
+      APP_NAME=$(basename "$CI_PROJECT_PATH")
+      echo "APP_NAME=$APP_NAME" >> build.env
+      echo "Detected application/repo name: $APP_NAME"
+
+      TARGET_IMAGE="$BASE_TARGET_REGISTRY/$APP_NAME"
+      echo "Target image: $TARGET_IMAGE"
+
+      echo " Moving to Dockerfile path: $DOCKERFILE_PATH"
+      cd "$CI_PROJECT_DIR/$DOCKERFILE_PATH"
+
+      # Validate Dockerfile
+      test -f Dockerfile || (echo " ERROR: Dockerfile not found" && exit 1)
+
+      # --------------------------------------------------------------------
+      # Tag Logic:
+      # - main branch: shortSHA
+      # - other branches: branch-shortSHA
+
+      # --------------------------------------------------------------------
+      
+      SHORT_SHA=$(echo "$CI_COMMIT_SHA" | cut -c1-8)
+      
+
+      
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        COMBINED_TAG="$SHORT_SHA"
+      else
+        BRANCH_TAG=$(echo "$CI_COMMIT_REF_NAME" | tr '[:upper:]' '[:lower:]' | tr '/' '-')
+        COMBINED_TAG="${BRANCH_TAG}-${SHORT_SHA}"
+      fi
+
+      echo "Final tags to be created:"
+      echo "   → $COMBINED_TAG"
+      echo "   → latest"
+      
+      # --------------------------------------------------------------------
+      # Build docker image with only 2 tags
+      # --------------------------------------------------------------------
+      echo "Building Docker image..."
+      docker build \
+        -t "$TARGET_IMAGE:$COMBINED_TAG" \
+        -t "$TARGET_IMAGE:latest" \
+        .
+
+      # Push branch-commit tag
+      echo " Pushing branch tag: $COMBINED_TAG ..."
+      docker push "$TARGET_IMAGE:$COMBINED_TAG"
+
+      # Push latest tag
+      echo " Pushing latest..."
+      docker push "$TARGET_IMAGE:latest"
+
+      # Passing image tag and combined tag to cd/deploy.yaml
+      echo "IMAGE_NAME=$TARGET_IMAGE" >> build.env
+      echo "IMAGE_TAG=$COMBINED_TAG" >> build.env
+
+  
+  artifacts:
+    reports:
+      dotenv: build.env
+    
+    
+/nem/ci/pipeline-for-non-main.yaml
+pipeline_non_main_mr:
+  stage: non-main-mr
+
+  tags:
+    - docker
+    - $RUNNER_TAG
+
+
+  tags:
+    - docker
+    - $RUNNER_TAG
+  script:
+    - echo "Non-main to non-main MR - SKIPPING SONAR & UT PIPELINE"
+
+  rules:
+    #  Run only for MR pipelines where target is NOT main
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != "main"'
+      when: always
+
+    #  Skip all other cases
+    - when: never
+
+
+
+
+
+
+
+
+/nem/cd/deploy-after-build.yaml
+deploy:
+  stage: deploy
+  needs:
+    - job: build_and_push_image
+      artifacts: true
+
+  tags:
+    - shell-runner
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+
+
+  script:
+    - |
+      echo "Starting deployment..."
+
+      APP_NAME="$CI_PROJECT_NAME"
+
+      # Validate required variables
+      if [ -z "$APP_NAME" ] || [ -z "$IMAGE_NAME" ] || [ -z "$IMAGE_TAG" ]; then
+        echo "ERROR: Required variables not set (APP_NAME, IMAGE_NAME, IMAGE_TAG)"
+        exit 1
+      fi
+
+      # Move to manifest directory
+      cd ../opnms3ps-platform/manual-deployment/opnms3ps_manifest_templates || exit 1
+
+      echo "Looking for manifest file for app: $APP_NAME"
+
+      # Find matching manifest file
+      MANIFEST_FILE="${APP_NAME}-manifest.yaml"
+
+      if [ -z "$MANIFEST_FILE" ]; then
+        echo "ERROR: No manifest file found for $APP_NAME"
+        exit 1
+      fi
+
+      echo "Found manifest: $MANIFEST_FILE"
+
+      # Construct full image
+      FULL_IMAGE="$IMAGE_NAME:$IMAGE_TAG"
+      echo "Updating image to: $FULL_IMAGE"
+
+      NAMESPACE_NAME="ci-ns"
+      # Updating manifest image and namespace
+      sed -i \
+        -e "s|image: .*${APP_NAME}:.*|image: ${FULL_IMAGE}|g" \
+        -e "s|namespace:.*|namespace: ${NAMESPACE_NAME}|g" \
+        "$MANIFEST_FILE"
+
+      echo "Updated manifest preview:"
+      grep "namespace:" "$MANIFEST_FILE"
+      grep "image:" "$MANIFEST_FILE"
+
+      # Deploy
+      echo "Applying manifest..."
+      kubectl apply -f "$MANIFEST_FILE" -n $NAMESPACE_NAME
+      
+      sleep 10
+
+      echo "Waiting for rollout to complete..."
+      kubectl rollout status deployment/$APP_NAME -n "$NAMESPACE_NAME" --timeout=300s
+      output=$?
+
+      echo "Deployment exit code: $output"
+
+      if [ $output -ne 0 ]; then
+        echo " Deployment FAILED"
+        exit 1
+      else
+        kubectl get pods -n "$NAMESPACE_NAME" -o custom-columns="NAMESPACE:.metadata.namespace,POD:.metadata.name,IMAGE:.spec.containers[*].image,STATUS:.status.phase" | grep "$APP_NAME"
+
+        echo " Deployment successful and stable"
+      fi
+
+
+
+
+
+
+
+
+
+
+opnms3ps-san/.gitlab/ci/mr-sanity.yaml
+# All jobs here ONLY run on schedule
+.trigger-rules: &trigger-rules
+  rules:
+    - if: '$RUN_STAGE == "trigger-san"'
+      when: on_success
+    - when: never
+
+# ── Default ──────────────────────────────────────────────────
+default:
+  image: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+  services:
+    - name: registry-gitlab-ultimate.engine.capgemini.com/connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-platform/external/docker:24.0.7-dind
+      command: ["--tls=false"]
+      alias: docker
+
+
+  before_script:
+    - apk add --no-cache git
+    - docker info
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY"
+        -u "$CI_REGISTRY_USER" --password-stdin
+
+  tags:
+    - docker
+    - $RUNNER_TAG
+   
+  
+
+mr-sanity-prepare:tag:
+  stage: mr-sanity-prepare
+  <<: *trigger-rules
+  tags:
+    - docker
+    - $RUNNER_TAG
+  before_script: []   # skip docker login
+ 
+  variables:
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone        # MUST be clone for helm folder acces
+    
+  script:
+  - |
+    
+      # FULL_APP_NAME=opnms3ps-<APP> ie opnms3ps-cfm, opnms3ps-aus etc
+      # PROJECT_NAME=<APP> ie nem, cfm, nem, aus etc
+      # REPO_SLUG=opnms3ps-<APP> ie opnms3ps-cfm, opnms3ps-aus etc
+      # BRANCH_NAME getting from apps(branch-name from where sanity pipeline get triggered) which triggers this sanity pipeline
+      # MR_IID getting from apps which contains the MR number
+      
+      TIMESTAMP=$(date +%Y%m%d%H%M%S)
+      MR_PHASE_NAME="mr-sanity"      
+      BRANCH_NAME="${BRANCH_NAME}"
+      FULL_APP_NAME="${FULL_APP_NAME}"
+      MR_IID="${MR_IID}"
+      PROJECT_NAME=$(basename "${FULL_APP_NAME}" | sed 's/^opnms3ps-//')
+      NAMESPACE_NAME="dev-ns"
+      DATABASE_NAME="db-dev-ns"
+
+
+      # Validate required variables from triggering pipeline
+      if [ -z "${FULL_APP_NAME}" ] || [ -z "${BRANCH_NAME}" ] || [ -z "${MR_IID}" ]; then
+        echo "ERROR: Required variables not set. FULL_APP_NAME, BRANCH_NAME, and MR_IID must be provided by triggering pipeline."
+        exit 1
+      else
+        echo "MR_PHASE_NAME=$MR_PHASE_NAME" >> "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "PROJECT_NAME=$PROJECT_NAME"  >> "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "BRANCH_NAME=$BRANCH_NAME"   >> "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "MR_IID=$MR_IID"              >> "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "FULL_APP_NAME=$FULL_APP_NAME" >> "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "NAMESPACE_NAME=$NAMESPACE_NAME"  >> "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "TIMESTAMP=${TIMESTAMP}"   >> "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "DATABASE_NAME=${DATABASE_NAME}" >> "${CI_PROJECT_DIR}/sanity-build.env"
+        
+        echo "TIMESTAMP   : ${TIMESTAMP}"
+    
+        echo "===== build.env contents ====="
+        cat "${CI_PROJECT_DIR}/sanity-build.env"
+        echo "============================="  
+      fi
+
+     
+  artifacts:
+    reports:
+      dotenv: "${CI_PROJECT_DIR}/sanity-build.env"    # exports RELEASE_TAG into all downstream jobs
+    expire_in: 1 day
+
+
+      
+
+
+# ── Reusable sanitybuild template ───────────────────────────────────
+.mr-sanity-build:
+  stage: mr-sanity-build
+  <<: *trigger-rules
+  needs:
+    - job: mr-sanity-prepare:tag
+      artifacts: true   
+  tags:
+    - docker
+    - $RUNNER_TAG
+  script:
+  - |
+
+    echo "Platform PIPELINE triggered"
+
+
+    REPO_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_NAMESPACE}/${REPO_SLUG}.git"
+
+
+    if [ "${REPO_SLUG}" = "${FULL_APP_NAME}" ]; then
+      MR_SERVICE_BRANCH="${BRANCH_NAME}"
+      MR_IMAGE_TAG="${PROJECT_NAME}-test-${MR_IID}-${TIMESTAMP}"
+    else
+      MR_SERVICE_BRANCH="main"
+      MR_IMAGE_TAG="${PROJECT_NAME}-main-${MR_IID}-${TIMESTAMP}"
+    fi
+
+      echo "Cloning ${CI_PROJECT_NAMESPACE}/${REPO_SLUG} @ ${MR_SERVICE_BRANCH} ..."
+      git clone \
+        --depth 1 \
+        --branch "${MR_SERVICE_BRANCH}" \
+        "$REPO_URL" \
+        repo
+    
+     
+      echo "Starting Docker Sanity-build..."
+  
+      IMAGE_NAME="${CI_REGISTRY}/${CI_PROJECT_PATH}/${MR_PHASE_NAME}/${REPO_SLUG}:${MR_IMAGE_TAG}"
+
+      echo "Sanity building image ${IMAGE_NAME}"
+
+      export DOCKER_BUILDKIT=1
+      BUILD_SECRET_ARG=""
+
+      if [ "$USE_BUILD_SECRET" = "true" ]; then
+        BUILD_SECRET_ARG="--secret id=ci_job_token,env=CI_JOB_TOKEN"
+      fi
+
+      docker build \
+        $BUILD_SECRET_ARG \
+        --platform "${BUILD_PLATFORM}" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        --build-arg GIT_COMMIT="${CI_COMMIT_SHORT_SHA}" \
+        --build-arg GIT_BRANCH="${MR_SERVICE_BRANCH}" \
+        --build-arg BUILD_DATE="${TIMESTAMP}" \
+        -t "${IMAGE_NAME}" \
+        repo
+
+      echo "MR_IMAGE_TAG=${MR_IMAGE_TAG}" >> "${CI_PROJECT_DIR}/sanity-build.env"
+
+      
+      docker push "${IMAGE_NAME}"
+
+      echo "Sanity build Completed: ${IMAGE_NAME}"
+
+     
+  artifacts:
+    reports:
+      dotenv: "${CI_PROJECT_DIR}/sanity-build.env"    # exports RELEASE_TAG into all downstream jobs
+    expire_in: 1 day
+
+  after_script:
+    - rm -rf repo   # free runner disk space
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════
+# One job per service — all run in parallel
+# Each repo root contains a Dockerfile; no path config needed.
+# Override CLONE_BRANCH per job if a service uses a different default branch.
+# ══════════════════════════════════════════════════════════════
+
+mr-sanity-build:service-aus:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-aus
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+    
+
+mr-sanity-build:service-wui:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-wui
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+mr-sanity-build:service-agw:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-agw
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+mr-sanity-build:service-cfm:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-cfm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+mr-sanity-build:service-ewi:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-ewi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+    USE_BUILD_SECRET: "true"
+
+
+mr-sanity-build:service-nem:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-nem
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone 
+
+mr-sanity-build:service-wbs:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-wbs
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+mr-sanity-build:service-nbi:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-nbi
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+    USE_BUILD_SECRET: "true"
+
+mr-sanity-build:service-rpm:
+  extends: .mr-sanity-build
+  variables:
+    REPO_SLUG:  opnms3ps-rpm
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+
+
+mr-sanity-deploy:helm:
+  stage: mr-sanity-deploy
+  <<: *trigger-rules
+  resource_group: locking-pipeline    # ← lock held for ENTIRE child pipeline
+  tags:
+    - shell-runner
+  variables:
+    BUILD_PLATFORM: "linux/amd64"
+    GIT_STRATEGY: clone
+ 
+  needs:
+    - job: mr-sanity-prepare:tag
+      artifacts: true
+    - mr-sanity-build:service-aus
+    - mr-sanity-build:service-wui
+    - mr-sanity-build:service-agw
+    - mr-sanity-build:service-cfm
+    - mr-sanity-build:service-ewi
+    - mr-sanity-build:service-nem
+    - mr-sanity-build:service-wbs
+    - mr-sanity-build:service-nbi
+    - mr-sanity-build:service-rpm
+  
+
+
+  before_script:
+    - export KUBECONFIG=/home/gitlab-runner/.kube/config
+
+  script:
+    - |
+
+      PLATFORM_URL="https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_NAMESPACE}/opnms3ps-platform.git"
+      
+      git clone "$PLATFORM_URL" repo_dir
+
+      # Navigate to helm chart
+      cd repo_dir/helm/opnms3ps-stack
+      echo "Current directory: $(pwd)"
+      ls -l      
+    
+
+      if helm list -n ${NAMESPACE_NAME} | grep -q opnms3ps-stack; then
+        echo "Uninstalling opnms3ps-stack "
+        helm uninstall opnms3ps-stack -n ${NAMESPACE_NAME}
+        sleep 30
+      fi
+
+      
+
+      BASE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}"
+
+       # update all imageBase
+      sed -i "s|imageBase: \".*\"|imageBase: \"${BASE_PATH}/${MR_PHASE_NAME}\"|g" imageTag.yaml
+
+      # Recreate tags exactly as build jobs created them
+
+      TEST_TAG="${PROJECT_NAME}-test-${MR_IID}-${TIMESTAMP}"
+      MAIN_TAG="${PROJECT_NAME}-main-${MR_IID}-${TIMESTAMP}"
+
+      
+
+      # Set all services to main tag
+      sed -i "s|tag: \".*\"|tag: \"${MAIN_TAG}\"|g" imageTag.yaml
+
+      # TEST_TAG will be updated only to application which triggeres the sanity pipeline
+      
+      sed -i "/^${FULL_APP_NAME}:/,/^[^[:space:]]/ s|tag: \".*\"|tag: \"${TEST_TAG}\"|" imageTag.yaml
+
+      echo "Updated imageTag.yaml"
+
+      PRIMARY_POD=$(kubectl get cluster opnms3ps-postgres -n opnms3ps-postgres-ns -o jsonpath='{.status.currentPrimary}')
+ 
+      if [ -z "$PRIMARY_POD" ]; then
+        echo "Failed to fetch primary pod from cluster status"; exit 1
+      fi
+  
+      # DROP DATABASE - ${DATABASE_NAME}
+      echo "DROPPING DATABASE ${DATABASE_NAME}"
+      kubectl exec -n opnms3ps-postgres-ns ${PRIMARY_POD} -c postgres -- psql -U postgres -c "DROP DATABASE IF EXISTS \"$DATABASE_NAME\"  WITH (FORCE);"
+      sleep 30s
+
+      echo "CREATING DATABASE ${DATABASE_NAME}"
+      kubectl exec -n opnms3ps-postgres-ns ${PRIMARY_POD} -c postgres -- psql -U postgres -c "CREATE DATABASE \"$DATABASE_NAME\" OWNER nmsuser;"
+      sleep 30s
+
+
+      
+      helm dependency update
+      sleep 10
+
+      helm upgrade --install opnms3ps-stack . -f values.yaml -f imageTag.yaml \
+        --namespace ${NAMESPACE_NAME} \
+        --create-namespace \
+        --set global.namespace="${NAMESPACE_NAME}"
+
+      if [ $? -ne 0 ]; then
+          echo "Helm deployment failed"
+          exit 1
+      fi
+
+
+      echo "Waiting for all deployments to rollout..."
+
+      kubectl get deploy -n ${NAMESPACE_NAME} -o name
+      sleep 5
+
+      kubectl rollout status deployment -n ${NAMESPACE_NAME} --timeout=300s
+      output=$?
+
+      echo "Deployment exit code: $output"
+
+      if [ $output -ne 0 ]; then
+        echo " Deployment not healthy"
+        echo "Uninstalling Deployment"
+        exit 1
+      else
+        kubectl get pods -o jsonpath="{range .items[*]}{.metadata.name}{': '}{.spec.containers[*].image}{'\n'}{end}" -n ${NAMESPACE_NAME} | grep -v kafka
+        echo " Deployment successful and stable"
+      fi
+
+      echo "Waiting for 10 minutes..."
+      for i in {9..0}; do
+        sleep 60
+        echo "$i minutes left"
+      done
+
+      RESTARTING=$(kubectl get pods -n ${NAMESPACE_NAME} --no-headers | grep -v "kafka" | awk '{sum += $4} END {print sum}')
+
+      if [ "$RESTARTING" -gt 0 ]; then
+        echo "Pods are restarting. Hence pipeline failed"
+        exit 1
+      fi
+
+      # Wait for ingress to be available
+      until kubectl get ingress -n ${NAMESPACE_NAME}; do
+        echo "Waiting for ingress..."
+        sleep 5
+      done
+
+      # Get ingress host dynamically
+      INGRESS_HOST=$(kubectl get ingress -n "${NAMESPACE_NAME}" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+
+      if [ -z "$INGRESS_HOST" ]; then
+        echo "ERROR: Could not retrieve ingress hostname"
+        exit 1
+      fi
+
+    
+      APP_URL="https://${INGRESS_HOST}"
+
+      echo "Sanity testing URL: $APP_URL"
+      echo "APP_URL =$APP_URL"  >> "${CI_PROJECT_DIR}/sanity-build.env"
+      
+  artifacts:
+    reports:
+      dotenv: "${CI_PROJECT_DIR}/sanity-build.env"
+
+
+mr-sanity-trigger-qa:
+  stage: mr-sanity-trigger-qa
+  <<: *trigger-rules
+  resource_group: locking-pipeline    # ← lock held for ENTIRE child pipeline
+  needs:
+    - job: mr-sanity-deploy:helm
+      artifacts: true
+  trigger:
+    project: connectivity-network-engineering/germany/vodafone-gmbh/op02477834-vf-nms-decoupling-f/opnms3ps-aqa
+    branch: main
+    strategy: depend
+  variables:
+    #PLATFORM_TRIGGER: "trigger-aqa"
+    APP_URL: $APP_URL
+
+
